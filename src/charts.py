@@ -214,6 +214,101 @@ def build_equity_comparison_chart(
 
 
 # ================================================================
+# GRAFICO 1b — Drawdown comparato (USD)
+# ================================================================
+
+def build_drawdown_chart(
+    equity_df: pd.DataFrame,
+    ts_name:   str,
+) -> go.Figure:
+    """
+    Grafico drawdown (in USD) per i 3 scenari equity.
+
+    Il drawdown è calcolato come distanza in dollari dal massimo rolling:
+        DD(t) = equity(t) - max(equity[0..t])
+
+    Valori sempre ≤ 0: zero indica che il sistema è sui massimi storici.
+
+    Args:
+        equity_df: DataFrame da build_equity_curves()
+        ts_name:   Nome del Trading System (per il titolo)
+
+    Returns:
+        go.Figure con le 3 serie DD sovrapposte (stesso schema colori equity)
+    """
+    if equity_df.empty:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="Nessun dato disponibile",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=16, color=COLORS["neutral"]),
+        )
+        fig.update_layout(**_base_layout(f"{ts_name} — Drawdown"))
+        return fig
+
+    has_vix = "vix_adjusted_equity" in equity_df.columns
+
+    def _dd(equity: pd.Series) -> pd.Series:
+        return equity - equity.cummax()
+
+    dd_base = _dd(equity_df["baseline_equity"])
+    dd_adj  = _dd(equity_df["adjusted_equity"])
+
+    fig = go.Figure()
+
+    # Baseline (arancio tratteggiato)
+    fig.add_trace(go.Scatter(
+        x=dd_base.index,
+        y=dd_base,
+        name="DD Baseline",
+        line=dict(color=COLORS["secondary"], width=1.5, dash="dot"),
+        fill="tozeroy",
+        fillcolor="rgba(255, 152, 0, 0.07)",
+        hovertemplate="<b>DD Baseline</b>: $%{y:,.0f}<extra></extra>",
+    ))
+
+    # Regime-Adjusted (blu tratteggiato)
+    fig.add_trace(go.Scatter(
+        x=dd_adj.index,
+        y=dd_adj,
+        name="DD Regime-Adj.",
+        line=dict(color=COLORS["primary"], width=1.8, dash="dash"),
+        fill="tozeroy",
+        fillcolor="rgba(33, 150, 243, 0.07)",
+        hovertemplate="<b>DD Regime-Adj.</b>: $%{y:,.0f}<extra></extra>",
+    ))
+
+    # Combined Regime+VIX (verde pieno)
+    if has_vix:
+        dd_comb = _dd(equity_df["vix_adjusted_equity"])
+        fig.add_trace(go.Scatter(
+            x=dd_comb.index,
+            y=dd_comb,
+            name="DD Combined (R+V)",
+            line=dict(color=COLORS["positive"], width=2.2),
+            fill="tozeroy",
+            fillcolor="rgba(76, 175, 80, 0.09)",
+            hovertemplate="<b>DD Combined</b>: $%{y:,.0f}<extra></extra>",
+        ))
+
+    # Linea zero
+    fig.add_hline(y=0, line_dash="solid", line_color=COLORS["neutral"], line_width=0.8)
+
+    fig.update_layout(
+        **_base_layout(
+            title=f"📉 {ts_name} — Drawdown (USD)",
+            y_title="Drawdown (USD)",
+            height=320,
+        )
+    )
+    fig.update_yaxes(color=COLORS["text"])
+    fig.update_xaxes(color=COLORS["text"])
+
+    return fig
+
+
+# ================================================================
 # GRAFICO 2 — Heatmap Performance per Regime
 # ================================================================
 
