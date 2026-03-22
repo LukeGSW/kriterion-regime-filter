@@ -3,16 +3,19 @@ app.py
 ======
 Kriterion Regime Filter — Dashboard Streamlit principale.
 
-Questa dashboard applica gli studi di Entropia ed Ergodicità sull'indice S&P 500
-per determinare il regime di mercato ottimale per ogni Trading System algoritmico.
+Questa dashboard applica gli studi di Entropia ed Ergodicità sull'indice S&P 500,
+con un terzo layer basato sul VIX (volatilità implicita), per determinare il regime
+di mercato ottimale per ogni Trading System algoritmico.
 
 Per ogni TS, il sistema:
   1. Scarica i file equity da Google Drive (pubblica)
   2. Calcola Shannon Entropy e Permutation Entropy sull'SPX (finestra 63g)
   3. Calcola l'Ergodicità SPX tramite il metodo SEM (finestra 252g)
-  4. Identifica le 6 combinazioni di regime (3 Entropia × 2 Ergodicità)
-  5. Ottimizza automaticamente le regole di esposizione per ogni TS
-  6. Mostra le equity curve baseline vs adjusted e lo stato corrente
+  4. Scarica e analizza il VIX: rolling percentile + isteresi (LOW/NORMAL/HIGH)
+  5. Identifica le 6 combinazioni di regime (3 Entropia × 2 Ergodicità)
+  6. Ottimizza le regole di esposizione per ogni TS su regime E su VIX state
+  7. Calcola il moltiplicatore finale COMBINATO = snap(regime × vix) ∈ {0/0.5/1/1.5}
+  8. Mostra le 3 equity curve (Baseline / Regime-Adj / Combined) e lo stato corrente
 
 Deploy: Streamlit Cloud — imposta EODHD_API_KEY, TELEGRAM_BOT_TOKEN,
         TELEGRAM_CHAT_ID nei Secrets di Streamlit Cloud.
@@ -47,8 +50,14 @@ from src.equity_loader  import (
 )
 from src.spx_data       import fetch_spx, get_latest_spx_info
 from src.regime_engine  import build_regime_series, REGIME_COLORS, REGIME_DESCRIPTIONS
-from src.optimizer      import optimize_all_ts, get_current_exposure, BOOST_RATIO, STANDARD_RATIO
+from src.optimizer      import optimize_all_ts, BOOST_RATIO, STANDARD_RATIO
 from src.exposure_engine import build_all_equity_curves, compute_performance_comparison
+from src.vix_modulator  import (
+    fetch_vix, compute_vix_features, get_current_vix_info,
+    optimize_all_ts_vix, get_combined_exposure,
+    VIX_STATE_LABELS, VIX_STATE_COLORS, VIX_STATE_EMOJIS, VIX_STATES,
+    HIGH_VIX_ENTRY_PCT, HIGH_VIX_EXIT_PCT, LOW_VIX_ENTRY_PCT, LOW_VIX_EXIT_PCT,
+)
 from src.charts         import (
     build_equity_comparison_chart,
     build_regime_heatmap,
@@ -56,6 +65,7 @@ from src.charts         import (
     build_exposure_gauge,
     build_pnl_distribution_chart,
     build_overview_table,
+    build_vix_chart,
 )
 from src.telegram_bot   import send_telegram_message, format_daily_report, send_test_message
 
@@ -89,10 +99,22 @@ def cached_fetch_spx(api_key: str, to_date: str) -> pd.DataFrame:
     return fetch_spx(api_key=api_key, to_date=to_date)
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_fetch_vix(api_key: str, to_date: str) -> pd.DataFrame:
+    """Cache del fetch VIX: stesso TTL di SPX (1 ora)."""
+    return fetch_vix(api_key=api_key, to_date=to_date)
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def cached_build_regime_series(spx_hash: str, _spx_df: pd.DataFrame) -> dict:
-    """Cache del calcolo regime: si invalida giornalmente (spx_hash include la data)."""
+    """Cache del calcolo regime: si invalida giornalmente."""
     return build_regime_series(_spx_df)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def cached_compute_vix_features(vix_hash: str, _vix_df: pd.DataFrame) -> pd.DataFrame:
+    """Cache del calcolo VIX features: si invalida giornalmente."""
+    return compute_vix_features(_vix_df)
 
 
 @st.cache_resource(show_spinner=False)
@@ -118,7 +140,7 @@ with st.sidebar:
         "Trade minimi per regime",
         min_value=3, max_value=30, value=8, step=1,
         help="Numero minimo di trade in un regime per assegnare una regola non-STANDARD. "
-             "Valori più bassi → più regole personalizzate ma con meno dati."
+             "Vale sia per i regimi Entropia+Ergodicità sia per gli stati VIX."
     )
 
     boost_ratio = st.slider(
@@ -134,6 +156,26 @@ with st.sidebar:
         format="%.2f×",
         help="Rapporto sopra il quale il regime è STANDARD. Sotto si applica REDUCE (-50%)."
     )
+
+    st.divider()
+
+    # ── VIX Isteresi ──────────────────────────────────────────
+    st.subheader("📊 VIX — Isteresi")
+
+    st.caption(
+        "Le bande di isteresi prevengono transizioni rapide sul confine "
+        "(anti-whipsaw). Entry > Exit in entrambe le direzioni."
+    )
+
+    col_h1, col_h2 = st.columns(2)
+    with col_h1:
+        st.caption("🔴 HIGH VIX")
+        st.caption(f"Entry: > {HIGH_VIX_ENTRY_PCT:.0f}°")
+        st.caption(f"Exit: < {HIGH_VIX_EXIT_PCT:.0f}°")
+    with col_h2:
+        st.caption("🔵 LOW VIX")
+        st.caption(f"Entry: < {LOW_VIX_ENTRY_PCT:.0f}°")
+        st.caption(f"Exit: > {LOW_VIX_EXIT_PCT:.0f}°")
 
     st.divider()
 
@@ -165,19 +207,19 @@ with st.sidebar:
 # ================================================================
 st.title("🎯 Kriterion Regime Filter")
 st.markdown("""
-Questo sistema applica gli studi di **Entropia** (Shannon + Permutation Entropy)
-ed **Ergodicità** (Standard Error of the Mean) sull'indice **S&P 500** per classificare
-il contesto di mercato in 6 regimi. Per ogni Trading System algoritmico, il backtest
-storico individua i regimi in cui il sistema ha performance significativamente migliori
-o peggiori, e regola di conseguenza l'esposizione al capitale:
+Questo sistema applica tre studi quantitativi sull'**S&P 500** per classificare
+il contesto di mercato e regolare l'esposizione dei Trading System algoritmici:
+
+- **Entropia** (Shannon + Permutation Entropy): complessità statistica dei log-return → 3 stati
+- **Ergodicità** (Standard Error of the Mean): stabilità strutturale della distribuzione → 2 stati
+- **VIX Percentile + Isteresi**: paura forward-looking del mercato delle opzioni → 3 stati
+
+Il **moltiplicatore finale** per ogni TS = **snap(Regime × VIX)** ∈ {×0, ×0.5, ×1.0, ×1.5}:
 
 - 🔴 **INIBITO** (×0): sistema disabilitato nel regime
 - 🟠 **RIDOTTO** (×0.5): capitale ridotto del 50%
 - 🟡 **STANDARD** (×1.0): esposizione normale
 - 🟢 **BOOST** (×1.5): capitale aumentato del 50%
-
-> **Come si usa:** il sistema si aggiorna automaticamente ogni giorno dopo la chiusura
-> dell'S&P 500. La colonna "Stato Attuale" mostra l'esposizione raccomandata per oggi.
 """)
 st.divider()
 
@@ -213,16 +255,22 @@ if not trading_systems:
     st.stop()
 
 # ================================================================
-# STEP 2 — FETCH SPX DA EODHD
+# STEP 2 — FETCH SPX E VIX DA EODHD
 # ================================================================
 today_str = str(date.today())
 
-with st.spinner("⏳ Download dati SPX da EODHD..."):
+with st.spinner("⏳ Download dati SPX e VIX da EODHD..."):
     try:
         spx_df = cached_fetch_spx(EODHD_API_KEY, today_str)
     except Exception as e:
         st.error(f"❌ Errore fetch SPX: {e}. Verifica la chiave EODHD_API_KEY.")
         st.stop()
+
+    try:
+        vix_df_raw = cached_fetch_vix(EODHD_API_KEY, today_str)
+    except Exception as e:
+        st.warning(f"⚠️ Fetch VIX fallito: {e}. Il sistema continuerà senza il layer VIX.")
+        vix_df_raw = pd.DataFrame()
 
 if spx_df.empty:
     st.error("❌ Dati SPX non disponibili. Verifica la chiave API EODHD.")
@@ -247,9 +295,31 @@ current_erg_state     = regime_data["current_erg_state"]
 last_date             = regime_data["last_date"]
 
 # ================================================================
-# STEP 4 — OTTIMIZZAZIONE ESPOSIZIONE PER OGNI TS
+# STEP 4 — CALCOLO VIX FEATURES + STATO CORRENTE
 # ================================================================
-with st.spinner("⏳ Ottimizzazione regole di esposizione per ogni Trading System..."):
+vix_features      = pd.DataFrame()
+current_vix_info  = {
+    "state":     "NORMAL_VIX",
+    "vix_close": float("nan"),
+    "vix_pct":   50.0,
+    "label":     VIX_STATE_LABELS["NORMAL_VIX"],
+    "color":     VIX_STATE_COLORS["NORMAL_VIX"],
+    "emoji":     VIX_STATE_EMOJIS["NORMAL_VIX"],
+}
+vix_available = False
+
+if not vix_df_raw.empty:
+    with st.spinner("⏳ Calcolo VIX percentile e stati isteresi..."):
+        vix_features     = cached_compute_vix_features(today_str, vix_df_raw)
+        current_vix_info = get_current_vix_info(vix_features)
+        vix_available    = not vix_features.empty
+
+current_vix_state = current_vix_info["state"]
+
+# ================================================================
+# STEP 5 — OTTIMIZZAZIONE ESPOSIZIONE PER OGNI TS (Regime)
+# ================================================================
+with st.spinner("⏳ Ottimizzazione regole di esposizione (Regime)..."):
     opt_results = optimize_all_ts(
         trading_systems = trading_systems,
         regime_series   = regime_series,
@@ -259,20 +329,42 @@ with st.spinner("⏳ Ottimizzazione regole di esposizione per ogni Trading Syste
     )
 
 # ================================================================
-# STEP 5 — EQUITY CURVES ADJUSTED
+# STEP 6 — OTTIMIZZAZIONE VIX PER OGNI TS
 # ================================================================
-with st.spinner("⏳ Costruzione equity curve adjusted..."):
+vix_opt_results: dict = {}
+if vix_available:
+    with st.spinner("⏳ Ottimizzazione regole di esposizione (VIX)..."):
+        vix_opt_results = optimize_all_ts_vix(
+            trading_systems = trading_systems,
+            vix_features    = vix_features,
+            min_trades      = min_trades,
+            boost_ratio     = boost_ratio,
+            standard_ratio  = standard_ratio,
+        )
+
+# ================================================================
+# STEP 7 — EQUITY CURVES (Baseline / Regime / Combined)
+# ================================================================
+with st.spinner("⏳ Costruzione equity curve (3 scenari)..."):
     equity_curves = build_all_equity_curves(
-        trading_systems = trading_systems,
-        regime_series   = regime_series,
-        opt_results     = opt_results,
+        trading_systems  = trading_systems,
+        regime_series    = regime_series,
+        opt_results      = opt_results,
+        vix_features     = vix_features if vix_available else None,
+        vix_opt_results  = vix_opt_results if vix_available else None,
     )
 
 # ================================================================
-# ESPOSIZIONI CORRENTI (usate in più sezioni)
+# ESPOSIZIONI CORRENTI COMBINED (usate in più sezioni)
 # ================================================================
 ts_exposures = {
-    ts_name: get_current_exposure(ts_name, opt_results, current_regime)
+    ts_name: get_combined_exposure(
+        ts_name           = ts_name,
+        opt_results       = opt_results,
+        vix_opt_results   = vix_opt_results,
+        current_regime    = current_regime,
+        current_vix_state = current_vix_state,
+    )
     for ts_name in trading_systems
 }
 
@@ -294,11 +386,10 @@ if send_report_now:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         st.sidebar.error("❌ Configura TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID nei Secrets.")
     else:
-        # Recupera valori correnti per il messaggio
-        last_sh  = float(entropy_feat["shannon_ret"].iloc[-1])
-        last_pe  = float(entropy_feat["perm_entropy"].iloc[-1])
-        last_diff= float(erg_feat["diff"].iloc[-1])
-        threshold= erg_thresh["threshold"]
+        last_sh   = float(entropy_feat["shannon_ret"].iloc[-1])
+        last_pe   = float(entropy_feat["perm_entropy"].iloc[-1])
+        last_diff = float(erg_feat["diff"].iloc[-1])
+        threshold = erg_thresh["threshold"]
 
         msg = format_daily_report(
             spx_info         = spx_info,
@@ -310,6 +401,7 @@ if send_report_now:
             erg_diff_val     = last_diff,
             erg_threshold    = threshold,
             ts_exposures     = ts_exposures,
+            vix_info         = current_vix_info if vix_available else None,
         )
         ok = send_telegram_message(msg, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
         if ok:
@@ -319,11 +411,27 @@ if send_report_now:
 
 
 # ================================================================
+# HELPER: Descrizione stato VIX (definita prima dei tab che la usano)
+# ================================================================
+def _vix_state_description(state: str) -> str:
+    descs = {
+        "LOW_VIX":    "Complacency di mercato. Volatilità implicita bassa: le opzioni prezzano "
+                      "pochi rischi. Regime di quiete, tendenzialmente favorevole a mean reversion.",
+        "NORMAL_VIX": "Condizioni di volatilità implicita nella norma storica. "
+                      "Nessuna anomalia nel pricing delle opzioni.",
+        "HIGH_VIX":   "Fear elevata. Il mercato delle opzioni prezza alta incertezza forward. "
+                      "Potenziale per forti movimenti direzionali ma anche alta dispersione.",
+    }
+    return descs.get(state, "Stato VIX in analisi.")
+
+
+# ================================================================
 # TAB NAVIGATION
 # ================================================================
-tab_overview, tab_spx_regime, tab_ts_detail, tab_methodology = st.tabs([
+tab_overview, tab_spx_regime, tab_vix, tab_ts_detail, tab_methodology = st.tabs([
     "📊 Overview & Stato Attuale",
     "📈 SPX — Regime Storico",
+    "📉 VIX — Volatilità Implicita",
     "🔍 Analisi per Trading System",
     "📚 Metodologia",
 ])
@@ -335,19 +443,20 @@ tab_overview, tab_spx_regime, tab_ts_detail, tab_methodology = st.tabs([
 with tab_overview:
 
     # ── KPI SPX attuali ──────────────────────────────────────────
-    st.subheader("📡 Condizioni di Mercato SPX — Ultima Candela")
+    st.subheader("📡 Condizioni di Mercato — Ultima Candela")
     st.markdown(
         f"Dati al **{last_date.strftime('%d/%m/%Y')}** "
         f"(chiusura mercato US 16:00 ET)"
     )
 
-    last_sh  = float(entropy_feat["shannon_ret"].iloc[-1])
-    last_pe  = float(entropy_feat["perm_entropy"].iloc[-1])
-    last_diff= float(erg_feat["diff"].iloc[-1])
-    threshold= erg_thresh["threshold"]
-    sh_pct   = float(entropy_feat["shannon_pctile"].iloc[-1])
+    last_sh   = float(entropy_feat["shannon_ret"].iloc[-1])
+    last_pe   = float(entropy_feat["perm_entropy"].iloc[-1])
+    last_diff = float(erg_feat["diff"].iloc[-1])
+    threshold = erg_thresh["threshold"]
+    sh_pct    = float(entropy_feat["shannon_pctile"].iloc[-1])
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    # 6 KPI: SPX, Entropy, Perm.Ent, Ergodicità, VIX, VIX Percentile
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
 
     c1.metric(
         "SPX Close",
@@ -371,40 +480,75 @@ with tab_overview:
         f"diff: {last_diff:+.5f}",
         delta_color="off",
     )
-    c5.metric(
-        "Percentile Entropia",
-        f"{sh_pct:.0f}°",
-        help="Percentile corrente della Shannon Entropy rispetto all'intera storia",
-        delta_color="off",
-    )
 
-    # Regime attuale evidenziato
+    if vix_available and not np.isnan(current_vix_info.get("vix_close", float("nan"))):
+        c5.metric(
+            "VIX Close",
+            f"{current_vix_info['vix_close']:.2f}",
+            current_vix_info["label"],
+            delta_color="off",
+        )
+        c6.metric(
+            "VIX Percentile",
+            f"{current_vix_info['vix_pct']:.0f}°",
+            f"{current_vix_info['emoji']} {current_vix_info['state'].replace('_',' ')}",
+            delta_color="off",
+        )
+    else:
+        c5.metric("VIX", "N/D", "Dati non disponibili", delta_color="off")
+        c6.metric("VIX Percentile", "N/D", delta_color="off")
+
+    # Regime composito evidenziato
     regime_color = REGIME_COLORS.get(current_regime, "#2196F3")
-    st.markdown(
-        f"""
-        <div style="
-            background-color: {regime_color}22;
-            border-left: 4px solid {regime_color};
-            border-radius: 6px;
-            padding: 14px 18px;
-            margin: 12px 0;
-        ">
-            <b style="font-size: 18px;">Regime Attuale: {current_regime}</b><br>
-            <span style="color: #CCCCCC; font-size: 14px;">
-                {REGIME_DESCRIPTIONS.get(current_regime, '')}
-            </span>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    vix_color    = current_vix_info.get("color", "#2E7D32")
+    vix_label_ui = current_vix_info.get("label", "N/D")
+    vix_emoji_ui = current_vix_info.get("emoji", "⚪")
+
+    col_r, col_v = st.columns(2)
+    with col_r:
+        st.markdown(
+            f"""
+            <div style="
+                background-color: {regime_color}22;
+                border-left: 4px solid {regime_color};
+                border-radius: 6px;
+                padding: 14px 18px;
+                margin: 8px 0;
+            ">
+                <b style="font-size: 16px;">🎯 Regime Entropia+Erg.: {current_regime}</b><br>
+                <span style="color: #CCCCCC; font-size: 13px;">
+                    {REGIME_DESCRIPTIONS.get(current_regime, '')}
+                </span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with col_v:
+        st.markdown(
+            f"""
+            <div style="
+                background-color: {vix_color}22;
+                border-left: 4px solid {vix_color};
+                border-radius: 6px;
+                padding: 14px 18px;
+                margin: 8px 0;
+            ">
+                <b style="font-size: 16px;">{vix_emoji_ui} VIX State: {vix_label_ui}</b><br>
+                <span style="color: #CCCCCC; font-size: 13px;">
+                    {_vix_state_description(current_vix_state)}
+                </span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
     st.divider()
 
     # ── Tabella stato corrente tutti i TS ────────────────────────
     st.subheader("💼 Stato Corrente — Tutti i Trading System")
     st.markdown(
-        "Esposizione raccomandata per ogni Trading System in base al regime attuale "
-        f"(**{current_regime}**) e alle regole ottimizzate dal backtest storico."
+        f"Esposizione **COMBINATA** (Regime × VIX) raccomandata per ogni TS. "
+        f"Regime: **{current_regime}** | VIX: **{vix_label_ui}**"
     )
 
     fig_table = build_overview_table(ts_exposures)
@@ -413,7 +557,7 @@ with tab_overview:
     st.divider()
 
     # ── Gauge per ogni TS ────────────────────────────────────────
-    st.subheader("🎯 Esposizione per Trading System")
+    st.subheader("🎯 Esposizione Combinata per Trading System")
 
     ts_names = list(trading_systems.keys())
     n_cols   = min(3, len(ts_names))
@@ -424,8 +568,8 @@ with tab_overview:
         with cols[i % n_cols]:
             fig_gauge = build_exposure_gauge(
                 ts_name    = ts_name,
-                multiplier = exp["multiplier"],
-                regime     = current_regime,
+                multiplier = exp["final_mult"],
+                regime     = f"{current_regime} | {current_vix_state.replace('_',' ')}",
             )
             st.plotly_chart(fig_gauge, width="stretch")
 
@@ -437,13 +581,16 @@ with tab_overview:
         for ts_name, ts_data in trading_systems.items():
             exp = ts_exposures[ts_name]
             summary_rows.append({
-                "Trading System": ts_name,
-                "File":           ts_data["filename"],
-                "Tipo":           "Short/Copertura" if ts_data["is_short"] else "Long",
-                "Dal":            ts_data["start_date"].strftime("%Y-%m-%d"),
-                "Al":             ts_data["end_date"].strftime("%Y-%m-%d"),
-                "N° Trade":       ts_data["n_trades"],
-                "Esposizione":    f"{exp['emoji']} {exp['label']}",
+                "Trading System":  ts_name,
+                "File":            ts_data["filename"],
+                "Tipo":            "Short/Copertura" if ts_data["is_short"] else "Long",
+                "Dal":             ts_data["start_date"].strftime("%Y-%m-%d"),
+                "Al":              ts_data["end_date"].strftime("%Y-%m-%d"),
+                "N° Trade":        ts_data["n_trades"],
+                "Molt. Regime":    f"×{exp['regime_mult']:.1f}",
+                "Molt. VIX":       f"×{exp['vix_mult']:.1f}",
+                "Molt. Combined":  f"×{exp['final_mult']:.1f}",
+                "Esposizione":     f"{exp['emoji']} {exp['label']}",
             })
         st.dataframe(
             pd.DataFrame(summary_rows).set_index("Trading System"),
@@ -459,14 +606,7 @@ with tab_spx_regime:
     st.subheader("📈 Analisi Storica Regime S&P 500")
     st.markdown("""
     Il grafico mostra l'andamento storico delle metriche di **Entropia** ed **Ergodicità**
-    calcolate sui prezzi dell'S&P 500:
-
-    - **Shannon Entropy** (pannello centrale): misura la complessità statistica dei
-      log-return. Alta entropia = alta imprevedibilità. La soglia p33/p67 divide in
-      tre regimi: Bassa / Media / Alta.
-    - **Diff Ergodicità** (pannello inferiore): differenza tra media temporale (rolling 252g)
-      e media spaziale (expanding). Valori oltre la banda tratteggiata indicano **non ergodicità**
-      (divergenza strutturale dal comportamento storico medio).
+    calcolate sui prezzi dell'S&P 500.
     """)
 
     fig_spx = build_spx_regime_chart(entropy_feat, erg_feat, regime_series)
@@ -474,7 +614,6 @@ with tab_spx_regime:
 
     st.divider()
 
-    # ── Statistiche soglie ────────────────────────────────────────
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("📐 Soglie Entropia")
@@ -503,12 +642,10 @@ with tab_spx_regime:
 
     st.divider()
 
-    # ── Distribuzione regime storica ──────────────────────────────
     st.subheader("📊 Distribuzione Storica dei Regimi")
     regime_counts = regime_series.value_counts().reset_index()
     regime_counts.columns = ["Regime", "N° Giorni"]
     regime_counts["% Giorni"] = (regime_counts["N° Giorni"] / regime_counts["N° Giorni"].sum() * 100).round(1)
-    regime_counts["Colore"] = regime_counts["Regime"].map(REGIME_COLORS)
     st.dataframe(
         regime_counts[["Regime", "N° Giorni", "% Giorni"]].set_index("Regime"),
         width="stretch",
@@ -516,7 +653,65 @@ with tab_spx_regime:
 
 
 # ================================================================
-# TAB 3 — ANALISI PER TRADING SYSTEM
+# TAB 3 — VIX — VOLATILITÀ IMPLICITA
+# ================================================================
+with tab_vix:
+
+    st.subheader("📉 Analisi VIX — Volatilità Implicita (Terzo Layer)")
+    st.markdown("""
+    Il **VIX** (CBOE Volatility Index) misura la volatilità implicita 30-day delle opzioni
+    sull'S&P 500. A differenza di Shannon Entropy (storica) ed Ergodicità (strutturale),
+    il VIX cattura la **paura forward-looking** del mercato delle opzioni.
+
+    - Il **rolling percentile** (finestra 252g) normalizza il VIX rispetto alla sua storia
+      recente, rendendolo confrontabile in periodi diversi.
+    - L'**isteresi** previene transizioni rapide sul confine delle soglie (anti-whipsaw):
+      per passare da NORMAL a HIGH serve percentile > 80°, per uscire da HIGH basta < 65°.
+    - Il **moltiplicatore VIX** per ogni TS è ottimizzato storicamente allo stesso modo
+      del moltiplicatore regime: BOOST / STANDARD / REDUCE / INHIBIT.
+    """)
+
+    if vix_available:
+        fig_vix = build_vix_chart(vix_features)
+        st.plotly_chart(fig_vix, width="stretch")
+
+        st.divider()
+
+        # KPI VIX correnti
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("VIX Close", f"{current_vix_info['vix_close']:.2f}")
+        col2.metric(
+            "Percentile Rolling",
+            f"{current_vix_info['vix_pct']:.1f}°",
+            help=f"Posizione del VIX corrente rispetto agli ultimi 252 giorni"
+        )
+        col3.metric("Stato (isteresi)", current_vix_info["label"])
+        col4.metric("Emoji Stato", current_vix_info["emoji"])
+
+        st.divider()
+
+        # Distribuzione storica degli stati VIX
+        if "vix_state" in vix_features.columns:
+            st.subheader("📊 Distribuzione Storica degli Stati VIX")
+            vix_state_counts = vix_features["vix_state"].value_counts().reset_index()
+            vix_state_counts.columns = ["Stato VIX", "N° Giorni"]
+            vix_state_counts["% Giorni"] = (
+                vix_state_counts["N° Giorni"] / vix_state_counts["N° Giorni"].sum() * 100
+            ).round(1)
+            vix_state_counts["Descrizione"] = vix_state_counts["Stato VIX"].map(VIX_STATE_LABELS)
+            st.dataframe(
+                vix_state_counts.set_index("Stato VIX"),
+                width="stretch",
+            )
+    else:
+        st.warning(
+            "⚠️ Dati VIX non disponibili. Verifica la chiave EODHD_API_KEY "
+            "e che il ticker VIX.INDX sia accessibile con il tuo piano."
+        )
+
+
+# ================================================================
+# TAB 4 — ANALISI PER TRADING SYSTEM
 # ================================================================
 with tab_ts_detail:
 
@@ -525,42 +720,48 @@ with tab_ts_detail:
     if not trading_systems:
         st.warning("Nessun Trading System disponibile.")
     else:
-        # Selezione TS
         selected_ts = st.selectbox(
             "Seleziona Trading System",
             options=list(trading_systems.keys()),
             format_func=lambda x: f"{'⚠️' if trading_systems[x]['is_short'] else '📈'} {x}",
         )
 
-        ts_data    = trading_systems[selected_ts]
-        opt_result = opt_results.get(selected_ts, {})
-        exp_curr   = ts_exposures[selected_ts]
+        ts_data      = trading_systems[selected_ts]
+        opt_result   = opt_results.get(selected_ts, {})
+        vix_opt_res  = vix_opt_results.get(selected_ts, {})
+        exp_curr     = ts_exposures[selected_ts]
 
         # Info TS
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Tipo",         "Short/Copertura" if ts_data["is_short"] else "Long Direzionale")
-        col2.metric("N° Trade",     f"{ts_data['n_trades']:,}")
-        col3.metric("Periodo",      f"{ts_data['start_date'].strftime('%Y')} – {ts_data['end_date'].strftime('%Y')}")
-        col4.metric("Stato Attuale", f"{exp_curr['emoji']} {exp_curr['label']} (×{exp_curr['multiplier']})")
+        col1, col2, col3, col4, col5 = st.columns(5)
+        col1.metric("Tipo",            "Short/Copertura" if ts_data["is_short"] else "Long")
+        col2.metric("N° Trade",        f"{ts_data['n_trades']:,}")
+        col3.metric("Periodo",         f"{ts_data['start_date'].strftime('%Y')} – {ts_data['end_date'].strftime('%Y')}")
+        col4.metric("Molt. Regime",    f"×{exp_curr['regime_mult']:.1f}")
+        col5.metric(
+            "Molt. Finale (R×V)",
+            f"{exp_curr['emoji']} ×{exp_curr['final_mult']:.1f}",
+            f"VIX: ×{exp_curr['vix_mult']:.1f}",
+            delta_color="off",
+        )
 
         if ts_data["is_short"]:
             st.info(
-                "⚠️ **Sistema Short/Copertura**: questo sistema opera in direzione opposta "
-                "al mercato. I regimi ottimali tipicamente divergono da quelli dei sistemi long."
+                "⚠️ **Sistema Short/Copertura**: la logica di esposizione si applica invariata. "
+                "Il PnL è già il netto del sistema, indipendentemente dalla direzione."
             )
 
         st.divider()
 
-        # ── Grafico Equity Curve ──────────────────────────────────
-        st.subheader("📈 Equity Curve Baseline vs Adjusted")
+        # ── Grafico Equity Curve (3 scenari) ─────────────────────
+        st.subheader("📈 Equity Curve — 3 Scenari")
         st.markdown(
-            "Il grafico mostra l'equity cumulata **senza filtro** (arancio tratteggiato) "
-            "confrontata con l'equity **adjusted** (blu) dove il PnL di ogni trade è "
-            "moltiplicato per il coefficiente del regime SPX all'ingresso."
+            "**Arancio tratteggiato** = Baseline (×1.0) | "
+            "**Blu tratteggiato** = Regime-Adjusted | "
+            "**Verde** = Combined (Regime × VIX)"
         )
 
         if selected_ts in equity_curves:
-            eq_df = equity_curves[selected_ts]
+            eq_df  = equity_curves[selected_ts]
             fig_eq = build_equity_comparison_chart(eq_df, selected_ts)
             st.plotly_chart(fig_eq, width="stretch")
 
@@ -568,58 +769,94 @@ with tab_ts_detail:
             perf = compute_performance_comparison(eq_df)
             if perf:
                 st.subheader("📊 Performance Comparata")
-                c1, c2, c3, c4 = st.columns(4)
-                baseline = perf["baseline"]
-                adjusted = perf["adjusted"]
+                has_vix_col = "vix_adjusted_equity" in eq_df.columns
 
-                c1.metric(
-                    "PnL Totale Baseline",
-                    f"${baseline['total_pnl']:,.0f}",
-                )
-                c2.metric(
-                    "PnL Totale Adjusted",
-                    f"${adjusted['total_pnl']:,.0f}",
-                    f"{perf['improvement']:+.1f}%",
-                    delta_color="normal" if perf["improvement"] >= 0 else "inverse",
-                )
-                c3.metric(
-                    "Max Drawdown Baseline",
-                    f"${baseline['max_drawdown']:,.0f}",
-                )
-                c4.metric(
-                    "Max Drawdown Adjusted",
-                    f"${adjusted['max_drawdown']:,.0f}",
-                    f"{(adjusted['max_drawdown'] - baseline['max_drawdown']) / abs(baseline['max_drawdown']) * 100:+.1f}%"
-                    if baseline["max_drawdown"] != 0 else "N/D",
-                    delta_color="inverse",  # drawdown: meno negativo = meglio
-                )
+                if has_vix_col:
+                    c1, c2, c3 = st.columns(3)
+                    baseline = perf["baseline"]
+                    adjusted = perf["adjusted"]
+
+                    c1.metric("PnL Baseline",         f"${baseline['total_pnl']:,.0f}")
+                    c2.metric(
+                        "PnL Regime-Adj.",
+                        f"${adjusted['total_pnl']:,.0f}",
+                        f"{perf['improvement']:+.1f}% vs Baseline",
+                        delta_color="normal" if perf["improvement"] >= 0 else "inverse",
+                    )
+
+                    # Metriche VIX-combined
+                    vix_total = float(eq_df["vix_adjusted_equity"].iloc[-1])
+                    vix_impr  = (
+                        (vix_total - baseline["total_pnl"]) / abs(baseline["total_pnl"]) * 100
+                        if baseline["total_pnl"] != 0 else 0.0
+                    )
+                    c3.metric(
+                        "PnL Combined (R+V)",
+                        f"${vix_total:,.0f}",
+                        f"{vix_impr:+.1f}% vs Baseline",
+                        delta_color="normal" if vix_impr >= 0 else "inverse",
+                    )
+                else:
+                    c1, c2 = st.columns(2)
+                    baseline = perf["baseline"]
+                    adjusted = perf["adjusted"]
+                    c1.metric("PnL Baseline",    f"${baseline['total_pnl']:,.0f}")
+                    c2.metric(
+                        "PnL Regime-Adj.",
+                        f"${adjusted['total_pnl']:,.0f}",
+                        f"{perf['improvement']:+.1f}%",
+                        delta_color="normal" if perf["improvement"] >= 0 else "inverse",
+                    )
         else:
             st.warning("Equity curve non disponibile per questo TS.")
 
         st.divider()
 
         # ── Heatmap PnL per Regime ────────────────────────────────
-        st.subheader("🔥 Mean PnL per Regime (3 Entropia × 2 Ergodicità)")
-        st.markdown(
-            "La heatmap mostra il PnL medio per trade in ciascuno dei 6 regimi. "
-            "Verde = regime favorevole, Rosso = regime sfavorevole. "
-            "Il numero in parentesi indica quanti trade storici sono disponibili nel campione."
-        )
-
+        st.subheader("🔥 Mean PnL per Regime Entropia+Ergodicità")
         regime_stats = opt_result.get("regime_stats", pd.DataFrame())
         if not regime_stats.empty:
             fig_hm = build_regime_heatmap(regime_stats, selected_ts)
             st.plotly_chart(fig_hm, width="stretch")
 
+        # ── Statistiche VIX per TS ────────────────────────────────
+        if vix_available and vix_opt_res:
+            st.divider()
+            st.subheader("📊 Performance per Stato VIX")
+            vix_stats = vix_opt_res.get("vix_stats", pd.DataFrame())
+
+            if not vix_stats.empty:
+                vix_rows = []
+                vix_rules = vix_opt_res.get("vix_rules", {})
+                for state in VIX_STATES:
+                    if state not in vix_stats.index:
+                        continue
+                    row  = vix_stats.loc[state]
+                    mult = vix_rules.get(state, 1.0)
+                    n    = int(row.get("n_trades", 0))
+                    mpnl = row.get("mean_pnl", float("nan"))
+                    wr   = row.get("win_rate", float("nan"))
+
+                    vix_rows.append({
+                        "Stato VIX":    VIX_STATE_LABELS.get(state, state),
+                        "N° Trade":     n,
+                        "Mean PnL ($)": f"${mpnl:,.0f}" if not pd.isna(mpnl) else "N/D",
+                        "Win Rate (%)": f"{wr:.1f}%" if not pd.isna(wr) else "N/D",
+                        "Molt. VIX":    f"×{mult:.1f}",
+                        "Esposizione":  f"{EXPOSURE_EMOJIS.get(mult,'🟡')} {EXPOSURE_LABELS.get(mult,'STANDARD')}",
+                        "Attivo?":      "✅" if state == current_vix_state else "",
+                    })
+
+                if vix_rows:
+                    st.dataframe(
+                        pd.DataFrame(vix_rows).set_index("Stato VIX"),
+                        width="stretch",
+                    )
+
         st.divider()
 
         # ── Distribuzione PnL per Regime ──────────────────────────
         st.subheader("📦 Distribuzione PnL per Regime (Box Plot)")
-        st.markdown(
-            "Box plot del PnL per ogni regime: mostra mediana, range interquartile "
-            "e outlier. Il punto interno è la media. Permette di identificare non solo "
-            "la performance media ma anche la dispersione e i tail risk."
-        )
         fig_box = build_pnl_distribution_chart(
             trades        = ts_data["trades"],
             regime_series = regime_series,
@@ -629,27 +866,27 @@ with tab_ts_detail:
 
         st.divider()
 
-        # ── Tabella regole di esposizione ────────────────────────
-        st.subheader("⚖️ Regole di Esposizione Ottimizzate")
+        # ── Tabella regole di esposizione regime ──────────────────
+        st.subheader("⚖️ Regole di Esposizione — Regime Entropia+Ergodicità")
 
         rules = opt_result.get("exposure_rules", {})
-        if regime_stats.empty or rules:
+        if not regime_stats.empty and rules:
             rule_rows = []
-            for regime in list(regime_stats.index if not regime_stats.empty else []):
-                row = regime_stats.loc[regime] if not regime_stats.empty else {}
-                mult  = rules.get(regime, 1.0)
-                n     = int(row.get("n_trades", 0)) if hasattr(row, "get") else 0
-                mpnl  = row.get("mean_pnl", np.nan) if hasattr(row, "get") else np.nan
-                wpnl  = row.get("win_rate", np.nan) if hasattr(row, "get") else np.nan
+            for regime in list(regime_stats.index):
+                row  = regime_stats.loc[regime]
+                mult = rules.get(regime, 1.0)
+                n    = int(row.get("n_trades", 0)) if hasattr(row, "get") else 0
+                mpnl = row.get("mean_pnl", float("nan")) if hasattr(row, "get") else float("nan")
+                wpnl = row.get("win_rate", float("nan")) if hasattr(row, "get") else float("nan")
 
                 rule_rows.append({
-                    "Regime":           regime,
-                    "N° Trade":         n,
-                    "Mean PnL ($)":     f"${mpnl:,.0f}" if not pd.isna(mpnl) else "N/D",
-                    "Win Rate (%)":     f"{wpnl:.1f}%" if not pd.isna(wpnl) else "N/D",
-                    "Moltiplicatore":   f"{mult:.1f}×",
-                    "Esposizione":      f"{EXPOSURE_EMOJIS.get(mult,'🟡')} {EXPOSURE_LABELS.get(mult,'STANDARD')}",
-                    "Regime Attuale?":  "✅" if regime == current_regime else "",
+                    "Regime":          regime,
+                    "N° Trade":        n,
+                    "Mean PnL ($)":    f"${mpnl:,.0f}" if not pd.isna(mpnl) else "N/D",
+                    "Win Rate (%)":    f"{wpnl:.1f}%" if not pd.isna(wpnl) else "N/D",
+                    "Molt. Regime":    f"×{mult:.1f}",
+                    "Esposizione":     f"{EXPOSURE_EMOJIS.get(mult,'🟡')} {EXPOSURE_LABELS.get(mult,'STANDARD')}",
+                    "Attivo?":         "✅" if regime == current_regime else "",
                 })
 
             if rule_rows:
@@ -668,17 +905,19 @@ with tab_ts_detail:
             - Soglia BOOST: **{boost_ratio:.1f}×** la media globale
             - Soglia STANDARD: **{standard_ratio:.2f}×** la media globale
 
-            **Logica di assegnazione:**
+            **Logica di assegnazione (identica per Regime e VIX):**
             1. < {min_trades} trade nel regime → **STANDARD** (dati insufficienti)
             2. Mean PnL ≥ {boost_ratio:.1f}× media globale → **BOOST** (×1.5)
             3. Mean PnL ≥ {standard_ratio:.2f}× media globale → **STANDARD** (×1.0)
             4. Mean PnL ≥ $0 → **REDUCE** (×0.5)
             5. Mean PnL < $0 → **INHIBIT** (×0.0)
+
+            **Moltiplicatore finale:** snap(Regime × VIX) ∈ {{0, 0.5, 1.0, 1.5}}
             """)
 
 
 # ================================================================
-# TAB 4 — METODOLOGIA
+# TAB 5 — METODOLOGIA
 # ================================================================
 with tab_methodology:
 
@@ -692,15 +931,12 @@ with tab_methodology:
         $$H = -\\sum_i p_i \\cdot \\log_2(p_i)$$
 
         Calcolata su una finestra rolling di **63 giorni** (≈ 1 trimestre) sui log-return
-        giornalieri dell'S&P 500. La serie temporale viene discretizzata in **10 bin**.
+        giornalieri dell'S&P 500. La serie viene discretizzata in **10 bin**.
 
         **Soglie regime:** tertili della distribuzione storica di H
         - Regime **BASSA**: H ≤ P33 = `{entropy_thresh['p33_shannon']:.4f}`
         - Regime **MEDIA**: P33 < H ≤ P67 = `{entropy_thresh['p67_shannon']:.4f}`
         - Regime **ALTA**:  H > P67
-
-        **Interpretazione:** Alta entropia → alta imprevedibilità → mercato più casuale.
-        Bassa entropia → struttura nei rendimenti → possibile prevedibilità.
 
         *Riferimento: Shannon, C.E. (1948). A Mathematical Theory of Communication.*
         """)
@@ -708,15 +944,9 @@ with tab_methodology:
     with st.expander("🔀 Studio 2 — Permutation Entropy"):
         st.markdown(f"""
         La **Permutation Entropy** (Bandt & Pompe, 2002) misura la complessità
-        strutturale della sequenza temporale analizzando i pattern ordinali:
-
-        $$H_{{perm}} = -\\sum_i p_i \\cdot \\log_2(p_i) \\; / \\; \\log_2(m!)$$
-
-        Normalizzata in [0, 1]. Calcolata con embedding dimension **m = {3}**
-        su finestra rolling di **63 giorni**.
-
-        - PE ≈ 1 → alta complessità (serie vicina al random walk)
-        - PE << 1 → struttura temporale forte (potenziale prevedibilità)
+        strutturale della sequenza temporale analizzando i pattern ordinali.
+        Normalizzata in [0, 1], calcolata con embedding dimension m = 3,
+        finestra rolling di 63 giorni.
 
         *Riferimento: Bandt & Pompe (2002). Permutation Entropy. PRL 88, 174102.*
         """)
@@ -724,24 +954,42 @@ with tab_methodology:
     with st.expander("⚙️ Studio 3 — Ergodicità (Standard Error of the Mean)"):
         st.markdown(f"""
         L'**Ergodicità** misura se la media temporale (rolling) converge alla media
-        di lungo periodo (expanding). La soglia è il **SEM (Standard Error of the Mean)**:
+        di lungo periodo (expanding). Soglia = k × σ/√N.
 
-        $$\\text{{threshold}} = k \\times \\frac{{\\sigma}}{{\\sqrt{{N}}}}$$
-
-        Con: σ = `{erg_thresh['sigma_global']:.6f}` (volatilità globale SPX),
-        N = 252 (1 anno trading), k = `{erg_thresh['k_mult']:.2f}` (≈ 92% CI),
+        Con: σ = `{erg_thresh['sigma_global']:.6f}`, N = 252, k = `{erg_thresh['k_mult']:.2f}`,
         Soglia = `±{erg_thresh['threshold']:.6f}`.
-
-        Il mercato è **NON ERGODICO** quando `|rolling_mean − expanding_mean|` > soglia:
-        la stima locale si discosta significativamente dal comportamento storico medio.
 
         *Riferimento: Peters, O. (2019). The ergodicity problem in economics. Nature Physics 15.*
         """)
 
+    with st.expander("📉 Studio 4 — VIX Percentile + Isteresi (NUOVO)", expanded=True):
+        st.markdown(f"""
+        Il **VIX** (CBOE Volatility Index) misura la volatilità implicita delle opzioni
+        sull'S&P 500 a 30 giorni. A differenza dei primi due studi (storici/statistici),
+        il VIX cattura la paura **forward-looking** del mercato delle opzioni.
+
+        **Rolling Percentile (finestra 252g):** normalizza il VIX rispetto alla sua storia
+        recente. Un VIX a 25 in un regime tranquillo (pct 85°) è molto diverso da un VIX a 25
+        durante un periodo volatile (pct 40°).
+
+        **Isteresi anti-whipsaw:** previene transizioni rapide vicino alla soglia usando
+        due threshold per ogni confine:
+        - HIGH_VIX: entra quando percentile > **{HIGH_VIX_ENTRY_PCT:.0f}°**, esce quando < **{HIGH_VIX_EXIT_PCT:.0f}°**
+        - LOW_VIX:  entra quando percentile < **{LOW_VIX_ENTRY_PCT:.0f}°**, esce quando > **{LOW_VIX_EXIT_PCT:.0f}°**
+        - Le transizioni LOW↔HIGH passano obbligatoriamente per NORMAL
+
+        **Ottimizzazione per TS:** identica logica al regime entropia+ergodicità.
+        Per ogni TS, il sistema calcola il mean PnL in ciascuno dei 3 stati VIX
+        e assegna BOOST/STANDARD/REDUCE/INHIBIT.
+
+        **Moltiplicatore finale:** snap(regime_mult × vix_mult)
+        Snap-points: 0.25→INHIBIT, 0.75→REDUCE, 1.25→STANDARD/BOOST
+        """)
+
     with st.expander("🎯 Ottimizzazione Esposizione per Trading System"):
         st.markdown(f"""
-        Per ogni TS, il sistema calcola statisticamente la performance in ognuno dei
-        **6 regimi** (3 Entropia × 2 Ergodicità) e assegna un moltiplicatore di esposizione:
+        Per ogni TS, il sistema calcola la performance in ognuno dei **6 regimi**
+        (3 Entropia × 2 Ergodicità) e nei **3 stati VIX** separatamente, poi combina:
 
         | Condizione                                  | Moltiplicatore | Esposizione |
         |---------------------------------------------|---------------|-------------|
@@ -750,27 +998,23 @@ with tab_methodology:
         | Mean PnL ≥ $0                               | **×0.5**      | 🟠 RIDOTTO  |
         | Mean PnL < $0                               | **×0.0**      | 🔴 INIBITO  |
 
-        Regimi con meno di **{min_trades} trade** ricevono automaticamente **STANDARD**
-        per evitare regole basate su campioni statisticamente insufficienti.
-
-        I sistemi short/copertura applicano la stessa logica: il PnL è già il netto
-        del sistema, quindi un PnL positivo in un regime è un segnale favorevole
-        indipendentemente dalla direzione di mercato.
+        Il **moltiplicatore finale** = snap(molt_regime × molt_vix):
+        - BOOST(1.5) × REDUCE(0.5) = 0.75 → STANDARD(1.0)
+        - BOOST(1.5) × INHIBIT(0.0) = 0 → INHIBIT(0.0)
+        - STANDARD(1.0) × BOOST(1.5) = 1.5 → BOOST(1.5)
         """)
 
     with st.expander("📲 Notifica Telegram Giornaliera"):
         st.markdown("""
         Il report Telegram viene inviato automaticamente tramite `notify.py`
-        ogni giorno di mercato (lunedì-venerdì) alle **16:30 ET** (22:30 CEST estate,
-        21:30 CET inverno), dopo la chiusura definitiva dell'S&P 500 e con buffer
-        di 30 minuti per garantire che i dati siano aggiornati su EODHD.
+        ogni giorno di mercato (lunedì-venerdì) alle **16:30 ET** (22:30 CEST estate).
+
+        Il messaggio include: SPX close, Shannon/Perm Entropy, Ergodicità, **VIX state**,
+        e per ogni TS il dettaglio Regime×VIX = Combined.
 
         **Setup cron (Linux/Mac):**
         ```bash
         30 21 * * 1-5 cd /path/to/kriterion-regime-filter && python notify.py
         ```
-        **Setup Windows Task Scheduler:**
-        Vedi il README per le istruzioni complete.
-
         **Invio manuale:** usa il pulsante "📤 Invia Report Ora" nella sidebar.
         """)
