@@ -90,9 +90,9 @@ def build_equity_comparison_chart(
     """
     Grafico a doppio pannello: equity curve + esposizione storica.
 
-    Pannello superiore (70%): Equity curve baseline (arancio) vs adjusted (blu).
-    Pannello inferiore (30%): Serie storica del moltiplicatore di esposizione
-                              (step chart colorato per livello).
+    Pannello superiore (70%): Equity curve baseline (arancio) vs regime-adjusted (blu)
+                               vs VIX-combined (verde, se disponibile).
+    Pannello inferiore (30%): Serie storica del moltiplicatore di esposizione.
 
     Args:
         equity_df: DataFrame da build_equity_curves()
@@ -111,6 +111,8 @@ def build_equity_comparison_chart(
         )
         fig.update_layout(**_base_layout(f"{ts_name} — Nessun dato"))
         return fig
+
+    has_vix = "vix_adjusted_equity" in equity_df.columns
 
     fig = make_subplots(
         rows=2, cols=1,
@@ -136,19 +138,33 @@ def build_equity_comparison_chart(
         go.Scatter(
             x=equity_df.index,
             y=equity_df["adjusted_equity"],
-            name="Adjusted (regime-filtered)",
-            line=dict(color=COLORS["primary"], width=2.2),
-            hovertemplate="<b>Adjusted</b>: $%{y:,.0f}<extra></extra>",
+            name="Regime-Adjusted",
+            line=dict(color=COLORS["primary"], width=2.0, dash="dash"),
+            hovertemplate="<b>Regime-Adj.</b>: $%{y:,.0f}<extra></extra>",
         ),
         row=1, col=1,
     )
+
+    if has_vix:
+        fig.add_trace(
+            go.Scatter(
+                x=equity_df.index,
+                y=equity_df["vix_adjusted_equity"],
+                name="Combined (Regime + VIX)",
+                line=dict(color=COLORS["positive"], width=2.4),
+                hovertemplate="<b>Combined</b>: $%{y:,.0f}<extra></extra>",
+            ),
+            row=1, col=1,
+        )
 
     # Linea dello zero
     fig.add_hline(y=0, line_dash="solid", line_color=COLORS["neutral"],
                   line_width=0.8, row=1, col=1)
 
-    # ── Pannello 2: Esposizione ──────────────────────────────────
-    exposure = equity_df["exposure_level"]
+    # ── Pannello 2: Esposizione (combined se disponibile, altrimenti regime) ──
+    exp_col = "combined_mult" if has_vix and "combined_mult" in equity_df.columns else "exposure_level"
+    exposure = equity_df[exp_col]
+
     colors_map = {
         0.0: COLORS["inhibit"],
         0.5: COLORS["reduce"],
@@ -156,7 +172,6 @@ def build_equity_comparison_chart(
         1.5: COLORS["boost"],
     }
 
-    # Raggruppa per run-length encoding per visualizzare bande colorate
     for mult, color in colors_map.items():
         mask = exposure.round(2) == round(mult, 2)
         if not mask.any():
@@ -177,19 +192,21 @@ def build_equity_comparison_chart(
             row=2, col=1,
         )
 
+    subtitle_equity = "Equity Curve (USD)" + (" — 3 scenari" if has_vix else "")
+
     fig.update_layout(
         **_base_layout(
-            title=f"📈 {ts_name} — Equity Baseline vs Adjusted",
-            height=550,
+            title=f"📈 {ts_name} — Equity Baseline vs Regime vs Combined",
+            height=570,
         )
     )
     fig.update_yaxes(title_text="Equity (USD)", row=1, col=1,
                      color=COLORS["text"])
-    fig.update_yaxes(title_text="Moltiplicatore", row=2, col=1,
+    exp_label = "Molt. Combined" if has_vix else "Molt. Regime"
+    fig.update_yaxes(title_text=exp_label, row=2, col=1,
                      range=[-0.1, 1.8], color=COLORS["text"])
     fig.update_xaxes(color=COLORS["text"])
 
-    # Formatta il subplot title
     for ann in fig.layout.annotations:
         ann.update(font=dict(color=COLORS["text"], size=13))
 
@@ -577,5 +594,161 @@ def build_overview_table(
         margin=dict(l=0, r=0, t=30, b=0),
         height=max(200, 40 * len(rows) + 60),
     )
+
+    return fig
+
+
+# ================================================================
+# GRAFICO 7 — VIX Percentile + Stato Isteresi
+# ================================================================
+
+def build_vix_chart(vix_features: "pd.DataFrame") -> go.Figure:
+    """
+    Grafico VIX a 3 pannelli: Close, Percentile Rolling + bande isteresi, Stato.
+
+    Pannello 1 (40%): VIX Close (prezzi grezzi)
+    Pannello 2 (40%): Rolling Percentile (0–100) con 4 linee tratteggiate
+                       che delimitano le zone LOW/NORMAL/HIGH e le bande di isteresi
+    Pannello 3 (20%): Stato discreto con isteresi (LOW/NORMAL/HIGH) come serie numerica
+
+    Args:
+        vix_features: DataFrame da compute_vix_features()
+
+    Returns:
+        go.Figure con 3 pannelli condivisi sull'asse X
+    """
+    from .vix_modulator import (
+        HIGH_VIX_ENTRY_PCT, HIGH_VIX_EXIT_PCT,
+        LOW_VIX_ENTRY_PCT,  LOW_VIX_EXIT_PCT,
+        VIX_STATE_COLORS,
+    )
+
+    if vix_features is None or vix_features.empty:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="Dati VIX non disponibili",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=16, color=COLORS["neutral"]),
+        )
+        fig.update_layout(**_base_layout("VIX — Dati non disponibili"))
+        return fig
+
+    fig = make_subplots(
+        rows=3, cols=1,
+        row_heights=[0.40, 0.40, 0.20],
+        shared_xaxes=True,
+        vertical_spacing=0.03,
+        subplot_titles=[
+            "VIX Close (CBOE Volatility Index)",
+            f"Rolling Percentile {len(vix_features.dropna()[:252])}g — Zone Isteresi",
+            "Stato VIX con Isteresi",
+        ],
+    )
+
+    # ── Pannello 1: VIX Close ────────────────────────────────────
+    fig.add_trace(
+        go.Scatter(
+            x=vix_features.index,
+            y=vix_features["vix_close"],
+            name="VIX Close",
+            line=dict(color=COLORS["accent"], width=1.5),
+            fill="tozeroy",
+            fillcolor="rgba(171, 71, 188, 0.15)",
+            hovertemplate="VIX: %{y:.2f}<extra></extra>",
+        ),
+        row=1, col=1,
+    )
+
+    # ── Pannello 2: Percentile + Bande Isteresi ──────────────────
+    fig.add_trace(
+        go.Scatter(
+            x=vix_features.index,
+            y=vix_features["vix_pct"],
+            name="VIX Percentile",
+            line=dict(color=COLORS["secondary"], width=1.8),
+            hovertemplate="Percentile: %{y:.1f}°<extra></extra>",
+        ),
+        row=2, col=1,
+    )
+
+    # Bande isteresi (4 linee orizzontali)
+    hyst_lines = [
+        (HIGH_VIX_ENTRY_PCT, COLORS["negative"],  "dash",  f"Entry HIGH ({HIGH_VIX_ENTRY_PCT:.0f}°)"),
+        (HIGH_VIX_EXIT_PCT,  COLORS["negative"],  "dot",   f"Exit HIGH ({HIGH_VIX_EXIT_PCT:.0f}°)"),
+        (LOW_VIX_EXIT_PCT,   COLORS["primary"],   "dot",   f"Exit LOW ({LOW_VIX_EXIT_PCT:.0f}°)"),
+        (LOW_VIX_ENTRY_PCT,  COLORS["primary"],   "dash",  f"Entry LOW ({LOW_VIX_ENTRY_PCT:.0f}°)"),
+    ]
+    for level, color, dash, label in hyst_lines:
+        fig.add_hline(
+            y=level, line_dash=dash, line_color=color,
+            line_width=0.9, row=2, col=1,
+            annotation_text=label,
+            annotation_font_color=color,
+            annotation_font_size=10,
+            annotation_position="right",
+        )
+
+    # Fascia NORMAL (zona neutrale 35–65)
+    fig.add_hrect(
+        y0=LOW_VIX_EXIT_PCT, y1=HIGH_VIX_EXIT_PCT,
+        fillcolor="rgba(46, 125, 50, 0.08)",
+        line_width=0,
+        row=2, col=1,
+    )
+
+    # ── Pannello 3: Stato Discreto ───────────────────────────────
+    state_map = {"LOW_VIX": 1.0, "NORMAL_VIX": 2.0, "HIGH_VIX": 3.0}
+    state_labels_map = {"LOW_VIX": "LOW", "NORMAL_VIX": "NORMAL", "HIGH_VIX": "HIGH"}
+
+    if "vix_state" in vix_features.columns:
+        state_num = vix_features["vix_state"].map(state_map)
+        state_text = vix_features["vix_state"].map(state_labels_map)
+
+        for state, num_val in state_map.items():
+            mask = state_num == num_val
+            if not mask.any():
+                continue
+            y_vals = state_num.copy().astype(float)
+            y_vals[~mask] = np.nan
+
+            fig.add_trace(
+                go.Scatter(
+                    x=y_vals.index,
+                    y=y_vals,
+                    name=state_labels_map[state],
+                    mode="markers",
+                    marker=dict(
+                        color=VIX_STATE_COLORS.get(state, COLORS["neutral"]),
+                        size=5,
+                        symbol="square",
+                    ),
+                    hovertemplate=f"<b>{state}</b><extra></extra>",
+                    showlegend=True,
+                ),
+                row=3, col=1,
+            )
+
+    fig.update_layout(
+        **_base_layout(
+            title="📊 Analisi VIX — Percentile & Regime Volatilità Implicita",
+            height=620,
+        )
+    )
+    fig.update_yaxes(title_text="VIX",       row=1, col=1, color=COLORS["text"])
+    fig.update_yaxes(title_text="Percentile", row=2, col=1, color=COLORS["text"],
+                     range=[-2, 102])
+    fig.update_yaxes(
+        title_text="Stato",
+        row=3, col=1,
+        tickvals=[1, 2, 3],
+        ticktext=["LOW", "NORMAL", "HIGH"],
+        color=COLORS["text"],
+        range=[0, 4],
+    )
+    fig.update_xaxes(color=COLORS["text"])
+
+    for ann in fig.layout.annotations:
+        ann.update(font=dict(color=COLORS["text"], size=12))
 
     return fig
