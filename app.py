@@ -60,6 +60,7 @@ from src.vix_modulator  import (
 )
 from src.charts         import (
     build_equity_comparison_chart,
+    build_drawdown_chart,
     build_regime_heatmap,
     build_spx_regime_chart,
     build_exposure_gauge,
@@ -765,6 +766,10 @@ with tab_ts_detail:
             fig_eq = build_equity_comparison_chart(eq_df, selected_ts)
             st.plotly_chart(fig_eq, width="stretch")
 
+            # ── Drawdown chart ────────────────────────────────────
+            fig_dd = build_drawdown_chart(eq_df, selected_ts)
+            st.plotly_chart(fig_dd, width="stretch")
+
             # Metriche comparative
             perf = compute_performance_comparison(eq_df)
             if perf:
@@ -772,23 +777,28 @@ with tab_ts_detail:
                 has_vix_col = "vix_adjusted_equity" in eq_df.columns
 
                 if has_vix_col:
-                    c1, c2, c3 = st.columns(3)
                     baseline = perf["baseline"]
                     adjusted = perf["adjusted"]
 
-                    c1.metric("PnL Baseline",         f"${baseline['total_pnl']:,.0f}")
+                    # Metriche VIX-combined (PnL e drawdown calcolati inline)
+                    vix_equity = eq_df["vix_adjusted_equity"]
+                    vix_total  = float(vix_equity.iloc[-1])
+                    vix_impr   = (
+                        (vix_total - baseline["total_pnl"]) / abs(baseline["total_pnl"]) * 100
+                        if baseline["total_pnl"] != 0 else 0.0
+                    )
+                    dd_base_val = baseline["max_drawdown"]
+                    dd_adj_val  = adjusted["max_drawdown"]
+                    dd_vix_val  = float((vix_equity - vix_equity.cummax()).min())
+
+                    # Riga 1 — PnL totale
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("PnL Baseline",       f"${baseline['total_pnl']:,.0f}")
                     c2.metric(
                         "PnL Regime-Adj.",
                         f"${adjusted['total_pnl']:,.0f}",
                         f"{perf['improvement']:+.1f}% vs Baseline",
                         delta_color="normal" if perf["improvement"] >= 0 else "inverse",
-                    )
-
-                    # Metriche VIX-combined
-                    vix_total = float(eq_df["vix_adjusted_equity"].iloc[-1])
-                    vix_impr  = (
-                        (vix_total - baseline["total_pnl"]) / abs(baseline["total_pnl"]) * 100
-                        if baseline["total_pnl"] != 0 else 0.0
                     )
                     c3.metric(
                         "PnL Combined (R+V)",
@@ -796,16 +806,50 @@ with tab_ts_detail:
                         f"{vix_impr:+.1f}% vs Baseline",
                         delta_color="normal" if vix_impr >= 0 else "inverse",
                     )
+
+                    # Riga 2 — Max Drawdown
+                    d1, d2, d3 = st.columns(3)
+                    d1.metric("Max DD Baseline",     f"${dd_base_val:,.0f}")
+                    dd_adj_delta = dd_adj_val - dd_base_val   # positivo = DD ridotto (meno negativo)
+                    d2.metric(
+                        "Max DD Regime-Adj.",
+                        f"${dd_adj_val:,.0f}",
+                        f"${dd_adj_delta:+,.0f} vs Baseline",
+                        delta_color="normal" if dd_adj_delta >= 0 else "inverse",
+                    )
+                    dd_vix_delta = dd_vix_val - dd_base_val
+                    d3.metric(
+                        "Max DD Combined (R+V)",
+                        f"${dd_vix_val:,.0f}",
+                        f"${dd_vix_delta:+,.0f} vs Baseline",
+                        delta_color="normal" if dd_vix_delta >= 0 else "inverse",
+                    )
+
                 else:
-                    c1, c2 = st.columns(2)
                     baseline = perf["baseline"]
                     adjusted = perf["adjusted"]
-                    c1.metric("PnL Baseline",    f"${baseline['total_pnl']:,.0f}")
+                    dd_base_val = baseline["max_drawdown"]
+                    dd_adj_val  = adjusted["max_drawdown"]
+
+                    # Riga 1 — PnL totale
+                    c1, c2 = st.columns(2)
+                    c1.metric("PnL Baseline",   f"${baseline['total_pnl']:,.0f}")
                     c2.metric(
                         "PnL Regime-Adj.",
                         f"${adjusted['total_pnl']:,.0f}",
                         f"{perf['improvement']:+.1f}%",
                         delta_color="normal" if perf["improvement"] >= 0 else "inverse",
+                    )
+
+                    # Riga 2 — Max Drawdown
+                    d1, d2 = st.columns(2)
+                    d1.metric("Max DD Baseline",  f"${dd_base_val:,.0f}")
+                    dd_adj_delta = dd_adj_val - dd_base_val
+                    d2.metric(
+                        "Max DD Regime-Adj.",
+                        f"${dd_adj_val:,.0f}",
+                        f"${dd_adj_delta:+,.0f} vs Baseline",
+                        delta_color="normal" if dd_adj_delta >= 0 else "inverse",
                     )
         else:
             st.warning("Equity curve non disponibile per questo TS.")
