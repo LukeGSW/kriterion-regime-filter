@@ -66,12 +66,14 @@ from src.telegram_bot   import send_telegram_message, format_daily_report, send_
 try:
     EODHD_API_KEY      = st.secrets["EODHD_API_KEY"]
     TELEGRAM_BOT_TOKEN = st.secrets.get("TELEGRAM_BOT_TOKEN", "")
-    TELEGRAM_CHAT_ID   = st.secrets.get("TELEGRAM_CHAT_ID", "")
-except Exception:
+    TELEGRAM_CHAT_ID   = st.secrets.get("TELEGRAM_CHAT_ID",   "")
+except KeyError as missing_key:
     st.error(
-        "❌ **Secrets mancanti.** Configura `EODHD_API_KEY`, "
-        "`TELEGRAM_BOT_TOKEN` e `TELEGRAM_CHAT_ID` nei Secrets di Streamlit Cloud "
-        "o nel file `.streamlit/secrets.toml` in locale."
+        f"❌ **Secret mancante: `{missing_key}`**\n\n"
+        "Configura nei Secrets di Streamlit Cloud (o in `.streamlit/secrets.toml`):\n"
+        "- `EODHD_API_KEY` — chiave EODHD Historical Data\n"
+        "- `TELEGRAM_BOT_TOKEN` — token bot Telegram\n"
+        "- `TELEGRAM_CHAT_ID` — ID chat Telegram"
     )
     st.stop()
 
@@ -188,12 +190,17 @@ equities_dir = os.path.join(tempfile.gettempdir(), "kriterion_equities")
 with st.spinner("⏳ Caricamento file equity da Google Drive..."):
     try:
         equities_dir = download_equity_files(
-            folder_id       = DRIVE_FOLDER_ID,
-            dest_dir        = equities_dir,
+            folder_id        = DRIVE_FOLDER_ID,
+            dest_dir         = equities_dir,
             force_redownload = force_reload,
         )
     except RuntimeError as e:
         st.error(f"❌ Errore download Google Drive: {e}")
+        st.info(
+            "💡 **Suggerimento**: verifica che la cartella Drive sia condivisa come "
+            "**'Chiunque abbia il link può visualizzare'** "
+            "(tasto destro sulla cartella → Condividi → cambia permesso)."
+        )
         st.stop()
 
 trading_systems = cached_load_trading_systems(equities_dir)
@@ -401,7 +408,7 @@ with tab_overview:
     )
 
     fig_table = build_overview_table(ts_exposures)
-    st.plotly_chart(fig_table, use_container_width=True)
+    st.plotly_chart(fig_table, width="stretch")
 
     st.divider()
 
@@ -420,7 +427,7 @@ with tab_overview:
                 multiplier = exp["multiplier"],
                 regime     = current_regime,
             )
-            st.plotly_chart(fig_gauge, use_container_width=True)
+            st.plotly_chart(fig_gauge, width="stretch")
 
     st.divider()
 
@@ -440,7 +447,7 @@ with tab_overview:
             })
         st.dataframe(
             pd.DataFrame(summary_rows).set_index("Trading System"),
-            use_container_width=True,
+            width="stretch",
         )
 
 
@@ -463,7 +470,7 @@ with tab_spx_regime:
     """)
 
     fig_spx = build_spx_regime_chart(entropy_feat, erg_feat, regime_series)
-    st.plotly_chart(fig_spx, use_container_width=True)
+    st.plotly_chart(fig_spx, width="stretch")
 
     st.divider()
 
@@ -504,7 +511,7 @@ with tab_spx_regime:
     regime_counts["Colore"] = regime_counts["Regime"].map(REGIME_COLORS)
     st.dataframe(
         regime_counts[["Regime", "N° Giorni", "% Giorni"]].set_index("Regime"),
-        use_container_width=True,
+        width="stretch",
     )
 
 
@@ -555,7 +562,7 @@ with tab_ts_detail:
         if selected_ts in equity_curves:
             eq_df = equity_curves[selected_ts]
             fig_eq = build_equity_comparison_chart(eq_df, selected_ts)
-            st.plotly_chart(fig_eq, use_container_width=True)
+            st.plotly_chart(fig_eq, width="stretch")
 
             # Metriche comparative
             perf = compute_performance_comparison(eq_df)
@@ -602,7 +609,7 @@ with tab_ts_detail:
         regime_stats = opt_result.get("regime_stats", pd.DataFrame())
         if not regime_stats.empty:
             fig_hm = build_regime_heatmap(regime_stats, selected_ts)
-            st.plotly_chart(fig_hm, use_container_width=True)
+            st.plotly_chart(fig_hm, width="stretch")
 
         st.divider()
 
@@ -618,7 +625,7 @@ with tab_ts_detail:
             regime_series = regime_series,
             ts_name       = selected_ts,
         )
-        st.plotly_chart(fig_box, use_container_width=True)
+        st.plotly_chart(fig_box, width="stretch")
 
         st.divider()
 
@@ -648,7 +655,7 @@ with tab_ts_detail:
             if rule_rows:
                 st.dataframe(
                     pd.DataFrame(rule_rows).set_index("Regime"),
-                    use_container_width=True,
+                    width="stretch",
                 )
 
         with st.expander("ℹ️ Come sono calcolate le regole?"):
