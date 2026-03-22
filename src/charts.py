@@ -256,9 +256,11 @@ def build_regime_heatmap(
         colorscale="RdYlGn",
         zmid=0,
         colorbar=dict(
-            title="Mean PnL (USD)",
+            title=dict(
+                text="Mean PnL (USD)",
+                font=dict(color=COLORS["text"]),
+            ),
             tickfont=dict(color=COLORS["text"]),
-            titlefont=dict(color=COLORS["text"]),
         ),
         hovertemplate="Entropia: %{y}<br>Ergodicità: %{x}<br>Mean PnL: $%{z:,.0f}<extra></extra>",
     ))
