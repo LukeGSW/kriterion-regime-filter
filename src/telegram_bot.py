@@ -79,7 +79,8 @@ def format_daily_report(
     erg_diff_val:     float,
     erg_threshold:    float,
     ts_exposures:     dict[str, dict],
-    report_time:      datetime | None = None,
+    report_time:      "datetime | None" = None,
+    vix_info:         "dict | None" = None,
 ) -> str:
     """
     Formatta il messaggio Telegram giornaliero completo.
@@ -93,8 +94,12 @@ def format_daily_report(
         perm_entropy_val: Valore Permutation Entropy corrente
         erg_diff_val:     Valore diff ergodicità corrente
         erg_threshold:    Soglia SEM ergodicità
-        ts_exposures:     {ts_name: exposure_dict} da get_current_exposure()
+        ts_exposures:     {ts_name: exposure_dict} da get_combined_exposure()
+                          Gli exposure_dict devono avere:
+                            multiplier (float), label (str), emoji (str),
+                            regime_mult (float), vix_mult (float), final_mult (float) [opzionali]
         report_time:      Timestamp del report (default: ora corrente UTC)
+        vix_info:         Dizionario da get_current_vix_info() (opzionale)
 
     Returns:
         Stringa HTML formattata per Telegram
@@ -124,25 +129,45 @@ def format_daily_report(
     ent_icon   = ent_icons.get(entropy_state, "⚪")
     erg_icon   = erg_icons.get(erg_state, "⚪")
 
-    # Sezione Trading Systems
+    # ── Sezione VIX (se disponibile) ─────────────────────────────
+    vix_block = ""
+    if vix_info:
+        vix_state  = vix_info.get("state",     "NORMAL_VIX")
+        vix_close  = vix_info.get("vix_close", 0.0)
+        vix_pct    = vix_info.get("vix_pct",   50.0)
+        vix_emoji  = vix_info.get("emoji",     "🟢")
+        vix_label  = vix_info.get("label",     "Vol. Normale")
+
+        vix_block = (
+            f"  {vix_emoji} VIX: <code>{vix_close:.2f}</code> "
+            f"| Percentile: <code>{vix_pct:.0f}°</code> "
+            f"→ <b>{vix_label}</b>\n"
+        )
+
+    # ── Sezione Trading Systems ───────────────────────────────────
     ts_lines = []
     for ts_name, exp in ts_exposures.items():
         emoji = exp.get("emoji",      "🟡")
         label = exp.get("label",      "STANDARD")
         mult  = exp.get("multiplier", 1.0)
 
-        # Descrizione moltiplicatore
-        if mult == 1.5:
-            mult_str = "+50% capitale"
+        # Mostra dettaglio regime × VIX se disponibile
+        regime_mult = exp.get("regime_mult")
+        vix_mult    = exp.get("vix_mult")
+
+        if regime_mult is not None and vix_mult is not None:
+            detail = f"R:{regime_mult:.1f}× × V:{vix_mult:.1f}× = {mult:.1f}×"
+        elif mult == 1.5:
+            detail = "+50% capitale"
         elif mult == 0.5:
-            mult_str = "-50% capitale"
+            detail = "-50% capitale"
         elif mult == 0.0:
-            mult_str = "sistema inibito"
+            detail = "sistema inibito"
         else:
-            mult_str = "capitale standard"
+            detail = "capitale standard"
 
         ts_lines.append(
-            f"{emoji} <b>{ts_name}</b> → {label} ({mult_str})"
+            f"{emoji} <b>{ts_name}</b> → {label} ({detail})"
         )
 
     ts_block = "\n".join(ts_lines) if ts_lines else "Nessun TS disponibile"
@@ -165,7 +190,8 @@ def format_daily_report(
         f"  📐 Perm. Entropy: <code>{perm_entropy_val:.3f}</code>\n"
         f"  {erg_icon} Ergodicità: <b>{erg_state}</b> "
         f"| diff=<code>{erg_diff_val:+.5f}</code> "
-        f"| soglia=<code>±{erg_threshold:.5f}</code>\n\n"
+        f"| soglia=<code>±{erg_threshold:.5f}</code>\n"
+        f"{vix_block}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💼 <b>Stato Trading Systems</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
