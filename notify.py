@@ -8,11 +8,13 @@ Esegui questo script ogni giorno di mercato (lun-ven) alle 16:30 ET
 
 Funzionamento:
   1. Legge le configurazioni da .env o variabili d'ambiente
-  2. Scarica i dati SPX aggiornati da EODHD
-  3. Calcola i regimi di entropia ed ergodicità
-  4. Carica i file equity da Google Drive
-  5. Ottimizza le regole di esposizione
-  6. Formatta e invia il messaggio Telegram
+  2. Scarica i dati SPX e VIX aggiornati da EODHD
+  3. Calcola i regimi di entropia ed ergodicità (SPX)
+  4. Calcola VIX percentile + isteresi → stato VIX corrente
+  5. Carica i file equity da Google Drive
+  6. Ottimizza le regole di esposizione (regime + VIX) per ogni TS
+  7. Calcola il moltiplicatore finale combinato per ogni TS
+  8. Formatta e invia il messaggio Telegram con stato completo
 
 Setup cron (Linux/Mac) — esegui alle 21:30 UTC (= 16:30 ET + 30min buffer):
   30 21 * * 1-5  cd /path/to/kriterion-regime-filter && python notify.py
@@ -35,7 +37,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 
 # Carica .env se presente (per esecuzione locale)
 try:
@@ -54,10 +56,13 @@ sys.path.insert(0, PROJECT_DIR)
 from src.equity_loader  import download_equity_files, load_all_trading_systems
 from src.spx_data       import fetch_spx_no_cache, get_latest_spx_info
 from src.regime_engine  import build_regime_series
-from src.optimizer      import optimize_all_ts, get_current_exposure
-from src.telegram_bot   import send_telegram_message, format_daily_report
-from src.optimizer      import BOOST_RATIO, STANDARD_RATIO
+from src.optimizer      import optimize_all_ts, BOOST_RATIO, STANDARD_RATIO
 from src.equity_loader  import MIN_TRADES_PER_REGIME
+from src.vix_modulator  import (
+    fetch_vix, compute_vix_features, get_current_vix_info,
+    optimize_all_ts_vix, get_combined_exposure,
+)
+from src.telegram_bot   import send_telegram_message, format_daily_report
 
 
 # ================================================================
@@ -103,12 +108,12 @@ def main() -> None:
 
     # ── 1. Download equity da Google Drive ──────────────────────
     equities_dir = os.path.join(tempfile.gettempdir(), "kriterion_equities")
-    print("[1/5] Download equity da Google Drive...")
+    print("[1/6] Download equity da Google Drive...")
     try:
         equities_dir = download_equity_files(
             folder_id        = DRIVE_FOLDER_ID,
             dest_dir         = equities_dir,
-            force_redownload = False,   # usa cache se disponibile (aggiornata ogni ~24h)
+            force_redownload = False,
         )
     except RuntimeError as exc:
         print(f"[ERRORE] Download equity fallito: {exc}")
@@ -118,11 +123,11 @@ def main() -> None:
     print(f"  → {len(trading_systems)} Trading System caricati")
 
     if not trading_systems:
-        print("[ERRORE] Nessun Trading System disponibile. Controlla la cartella Drive.")
+        print("[ERRORE] Nessun Trading System disponibile.")
         sys.exit(1)
 
     # ── 2. Fetch SPX ─────────────────────────────────────────────
-    print("[2/5] Download dati SPX da EODHD...")
+    print("[2/6] Download dati SPX da EODHD...")
     try:
         spx_df = fetch_spx_no_cache(EODHD_API_KEY)
     except Exception as exc:
@@ -134,12 +139,32 @@ def main() -> None:
         sys.exit(1)
 
     spx_info = get_latest_spx_info(spx_df)
-    print(f"  → Ultima candela SPX: {spx_info.get('last_date', 'N/D')} | "
-          f"Close: ${spx_info.get('last_close', 0):,.2f} "
+    print(f"  → SPX: {spx_info.get('last_date', 'N/D')} | "
+          f"${spx_info.get('last_close', 0):,.2f} "
           f"({spx_info.get('day_return', 0):+.2f}%)")
 
-    # ── 3. Calcolo regime ─────────────────────────────────────────
-    print("[3/5] Calcolo regime (Entropia + Ergodicità)...")
+    # ── 3. Fetch VIX ─────────────────────────────────────────────
+    print("[3/6] Download dati VIX da EODHD...")
+    vix_features     = None
+    current_vix_info = None
+    current_vix_state = "NORMAL_VIX"
+
+    try:
+        vix_df_raw = fetch_vix(EODHD_API_KEY)
+        if not vix_df_raw.empty:
+            vix_features      = compute_vix_features(vix_df_raw)
+            current_vix_info  = get_current_vix_info(vix_features)
+            current_vix_state = current_vix_info["state"]
+            print(f"  → VIX: {current_vix_info.get('vix_close', 0):.2f} | "
+                  f"Percentile: {current_vix_info.get('vix_pct', 50):.0f}° | "
+                  f"Stato: {current_vix_info.get('label', 'N/D')}")
+        else:
+            print("  ⚠️ VIX vuoto, si procede senza layer VIX (moltiplicatori VIX = 1.0)")
+    except Exception as exc:
+        print(f"  ⚠️ Fetch VIX fallito ({exc}), si procede senza layer VIX.")
+
+    # ── 4. Calcolo regime SPX (Entropia + Ergodicità) ─────────────
+    print("[4/6] Calcolo regime (Entropia + Ergodicità)...")
     regime_data = build_regime_series(spx_df)
 
     regime_series         = regime_data["regime_series"]
@@ -155,12 +180,11 @@ def main() -> None:
     last_diff = float(erg_feat["diff"].iloc[-1])
     threshold = erg_thresh["threshold"]
 
-    print(f"  → Regime corrente: {current_regime}")
-    print(f"  → Shannon Entropy: {last_sh:.4f} ({current_entropy_state})")
-    print(f"  → Ergodicità diff: {last_diff:+.6f} | soglia: ±{threshold:.6f} ({current_erg_state})")
+    print(f"  → Regime: {current_regime} | Entropy: {last_sh:.4f} ({current_entropy_state})")
+    print(f"  → Ergodicità: diff={last_diff:+.6f} | soglia=±{threshold:.6f} ({current_erg_state})")
 
-    # ── 4. Ottimizzazione esposizione ─────────────────────────────
-    print("[4/5] Ottimizzazione regole di esposizione...")
+    # ── 5. Ottimizzazione esposizione (Regime + VIX) ──────────────
+    print("[5/6] Ottimizzazione regole di esposizione...")
     opt_results = optimize_all_ts(
         trading_systems = trading_systems,
         regime_series   = regime_series,
@@ -169,19 +193,39 @@ def main() -> None:
         standard_ratio  = STANDARD_RATIO,
     )
 
+    vix_opt_results: dict = {}
+    if vix_features is not None and not vix_features.empty:
+        vix_opt_results = optimize_all_ts_vix(
+            trading_systems = trading_systems,
+            vix_features    = vix_features,
+            min_trades      = MIN_TRADES_PER_REGIME,
+            boost_ratio     = BOOST_RATIO,
+            standard_ratio  = STANDARD_RATIO,
+        )
+
+    # Calcola esposizione COMBINATA per ogni TS
     ts_exposures = {
-        ts_name: get_current_exposure(ts_name, opt_results, current_regime)
+        ts_name: get_combined_exposure(
+            ts_name           = ts_name,
+            opt_results       = opt_results,
+            vix_opt_results   = vix_opt_results,
+            current_regime    = current_regime,
+            current_vix_state = current_vix_state,
+        )
         for ts_name in trading_systems
     }
 
     # Stampa riepilogo in console
     print("\n  === ESPOSIZIONI CORRENTI ===")
     for ts_name, exp in ts_exposures.items():
-        print(f"  {exp['emoji']} {ts_name:50s} → {exp['label']:8s} (×{exp['multiplier']})")
+        print(
+            f"  {exp['emoji']} {ts_name:50s} → {exp['label']:8s} "
+            f"(R:×{exp['regime_mult']:.1f} × V:×{exp['vix_mult']:.1f} = ×{exp['final_mult']:.1f})"
+        )
     print()
 
-    # ── 5. Formatta e invia messaggio Telegram ────────────────────
-    print("[5/5] Invio report Telegram...")
+    # ── 6. Formatta e invia messaggio Telegram ────────────────────
+    print("[6/6] Invio report Telegram...")
 
     msg = format_daily_report(
         spx_info         = spx_info,
@@ -194,14 +238,15 @@ def main() -> None:
         erg_threshold    = threshold,
         ts_exposures     = ts_exposures,
         report_time      = now,
+        vix_info         = current_vix_info,
     )
 
     ok = send_telegram_message(msg, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 
     if ok:
-        print(f"  ✅ Report Telegram inviato con successo.")
+        print("  ✅ Report Telegram inviato con successo.")
     else:
-        print(f"  ❌ Invio fallito. Controlla token e chat_id.")
+        print("  ❌ Invio fallito. Controlla token e chat_id.")
         sys.exit(1)
 
     print(f"[DONE] {now.strftime('%Y-%m-%d %H:%M UTC')}")
