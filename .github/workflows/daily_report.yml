@@ -1,0 +1,39 @@
+name: Kriterion Daily Telegram Report
+
+on:
+  schedule:
+    # Esegue alle 22:00 UTC dal lunedì al venerdì 
+    # (corrisponde alle 17:00 ET, garantendo i close di giornata effettivi)
+    - cron: '0 22 * * 1-5'
+  
+  # Questo trigger ti permette di testare o forzare l'invio del report
+  # manualmente cliccando su "Run workflow" dalla tab Actions di GitHub
+  workflow_dispatch: 
+
+jobs:
+  run-notifier:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout del repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10' # Mantengo la versione in linea con i tuoi .pyc
+          cache: 'pip'           # Velocizza le esecuzioni future mettendo in cache le librerie
+
+      - name: Installazione dipendenze
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Elaborazione e invio report Telegram
+        # Qui vengono iniettati i secret di GitHub come variabili d'ambiente per notify.py
+        env:
+          EODHD_API_KEY: ${{ secrets.EODHD_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python notify.py
