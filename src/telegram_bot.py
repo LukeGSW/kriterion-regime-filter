@@ -30,9 +30,9 @@ import pandas as pd
 # ================================================================
 
 def send_telegram_message(
-    message:   str,
-    bot_token: str,
-    chat_id:   str,
+    message:    str,
+    bot_token:  str,
+    chat_id:    str,
     parse_mode: str = "HTML",
 ) -> bool:
     """
@@ -81,6 +81,7 @@ def format_daily_report(
     ts_exposures:     dict[str, dict],
     report_time:      "datetime | None" = None,
     vix_info:         "dict | None" = None,
+    regime_changes:   "dict | None" = None,    # ← NUOVO parametro
 ) -> str:
     """
     Formatta il messaggio Telegram giornaliero completo.
@@ -100,6 +101,7 @@ def format_daily_report(
                             regime_mult (float), vix_mult (float), final_mult (float) [opzionali]
         report_time:      Timestamp del report (default: ora corrente UTC)
         vix_info:         Dizionario da get_current_vix_info() (opzionale)
+        regime_changes:   Dizionario da detect_changes() (opzionale)
 
     Returns:
         Stringa HTML formattata per Telegram
@@ -144,6 +146,41 @@ def format_daily_report(
             f"→ <b>{vix_label}</b>\n"
         )
 
+    # ── Sezione cambio regime (se presente) ──────────────────────
+    change_block = ""
+    if regime_changes and regime_changes.get("any_changed") and not regime_changes.get("is_first_run"):
+        change_lines = ["🔄 <b>CAMBIO DI REGIME RILEVATO</b>"]
+
+        if regime_changes.get("regime_changed"):
+            prev_r = regime_changes.get("previous_regime", "N/D")
+            change_lines.append(
+                f"  📊 Regime: <code>{prev_r}</code> → <code>{current_regime}</code>"
+            )
+
+        if regime_changes.get("vix_changed"):
+            _vix_labels = {
+                "HIGH_VIX":   "Alta Volatilità",
+                "LOW_VIX":    "Bassa Volatilità",
+                "NORMAL_VIX": "Vol. Normale",
+            }
+            prev_v       = regime_changes.get("previous_vix_state", "N/D")
+            prev_v_label = _vix_labels.get(prev_v, prev_v)
+            curr_v_label = vix_info.get("label", "N/D") if vix_info else "N/D"
+            change_lines.append(
+                f"  📉 VIX: <code>{prev_v_label}</code> → <code>{curr_v_label}</code>"
+            )
+
+        prev_date = regime_changes.get("previous_date", "N/D")
+        if prev_date != "N/D":
+            try:
+                _prev_dt      = datetime.fromisoformat(prev_date)
+                prev_date_str = _prev_dt.strftime("%d/%m/%Y")
+            except Exception:
+                prev_date_str = prev_date[:10]
+            change_lines.append(f"  ⏱ Precedente report: <code>{prev_date_str}</code>")
+
+        change_block = "\n".join(change_lines) + "\n\n"
+
     # ── Sezione Trading Systems ───────────────────────────────────
     ts_lines = []
     for ts_name, exp in ts_exposures.items():
@@ -184,6 +221,7 @@ def format_daily_report(
         f"  Chiusura: <code>${spx_close:,.2f}</code> "
         f"{ret_icon} <code>{day_ret:+.2f}%</code> (oggi)\n"
         f"  YTD: {ytd_icon} <code>{ytd_ret:+.2f}%</code>\n\n"
+        f"{change_block}"                        # ← blocco cambio regime
         f"🧪 <b>Metriche di Mercato SPX</b>\n"
         f"  {ent_icon} Shannon Entropy: <code>{entropy_val:.3f}</code> "
         f"→ Regime <b>{entropy_state}</b>\n"
