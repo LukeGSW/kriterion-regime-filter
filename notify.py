@@ -64,6 +64,12 @@ from src.vix_modulator  import (
 )
 from src.telegram_bot   import send_telegram_message, format_daily_report
 
+from src.regime_state_store import (
+    load_previous_state,
+    save_current_state,
+    detect_changes,
+)
+
 
 # ================================================================
 # CONFIGURAZIONE
@@ -101,6 +107,9 @@ def main() -> None:
 
     now = datetime.now(tz=timezone.utc)
     print(f"[{now.strftime('%Y-%m-%d %H:%M UTC')}] Avvio notify.py")
+
+    # ── 0.5 Carica stato regime precedente (per rilevamento cambiamenti) ──
+    previous_state = load_previous_state()
 
     # ── 0. Validazione configurazione ────────────────────────────
     if not validate_config():
@@ -227,18 +236,26 @@ def main() -> None:
     # ── 6. Formatta e invia messaggio Telegram ────────────────────
     print("[6/6] Invio report Telegram...")
 
+    # Rileva cambiamenti di regime rispetto al report precedente
+    regime_changes = detect_changes(
+        current_regime    = current_regime,
+        current_vix_state = current_vix_state,
+        previous_state    = previous_state,
+    )
+
     msg = format_daily_report(
-        spx_info         = spx_info,
-        current_regime   = current_regime,
-        entropy_state    = current_entropy_state,
-        erg_state        = current_erg_state,
-        entropy_val      = last_sh,
-        perm_entropy_val = last_pe,
-        erg_diff_val     = last_diff,
-        erg_threshold    = threshold,
-        ts_exposures     = ts_exposures,
-        report_time      = now,
-        vix_info         = current_vix_info,
+        spx_info          = spx_info,
+        current_regime    = current_regime,
+        entropy_state     = current_entropy_state,
+        erg_state         = current_erg_state,
+        entropy_val       = last_sh,
+        perm_entropy_val  = last_pe,
+        erg_diff_val      = last_diff,
+        erg_threshold     = threshold,
+        ts_exposures      = ts_exposures,
+        report_time       = now,
+        vix_info          = current_vix_info,
+        regime_changes    = regime_changes,   # ← NUOVO parametro
     )
 
     ok = send_telegram_message(msg, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
@@ -248,6 +265,16 @@ def main() -> None:
     else:
         print("  ❌ Invio fallito. Controlla token e chat_id.")
         sys.exit(1)
+
+    # Salva lo stato corrente per il confronto del report successivo
+    # (solo se l'invio è andato a buon fine: ok è True qui)
+    save_current_state(
+        current_regime    = current_regime,
+        current_vix_state = current_vix_state,
+        entropy_state     = current_entropy_state,
+        erg_state         = current_erg_state,
+    )
+    print("  💾 Stato regime salvato per il prossimo report.")
 
     print(f"[DONE] {now.strftime('%Y-%m-%d %H:%M UTC')}")
 
